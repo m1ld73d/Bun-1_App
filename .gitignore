@@ -251,3 +251,4 @@ google-services.json
 # Plugins (already resolved through pubspec.yaml)
 .flutter-plugins
 .flutter-plugins-dependencies
+ios/Runner.xcodeproj/project.pbxproj
