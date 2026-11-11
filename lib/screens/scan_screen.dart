@@ -5,6 +5,7 @@ import 'package:permission_handler/permission_handler.dart';
 import '../constants.dart';
 import '../models/board.dart';
 import '../services/board_manager.dart';
+import '../theme.dart';
 
 class ScanScreen extends StatefulWidget {
   final BoardManager manager;
@@ -71,7 +72,7 @@ class _ScanScreenState extends State<ScanScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Add Board'),
+        title: const Text('add board'),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(4),
           child: StreamBuilder<bool>(
@@ -83,26 +84,33 @@ class _ScanScreenState extends State<ScanScreen> {
           ),
         ),
       ),
-      body: StreamBuilder<List<ScanResult>>(
+      body: BunnyBackground(
+        child: StreamBuilder<List<ScanResult>>(
         stream: FlutterBluePlus.scanResults,
         initialData: const [],
         builder: (_, snap) {
           final results = snap.data ?? [];
 
           if (results.isEmpty) {
-            return const Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  CircularProgressIndicator(),
-                  SizedBox(height: 20),
-                  Text('Scanning for LoRa boards…'),
-                  SizedBox(height: 8),
-                  Text(
-                    'Make sure your ESP board is powered on.',
-                    style: TextStyle(color: Colors.grey),
-                  ),
-                ],
+            final cs = Theme.of(context).colorScheme;
+            return Center(
+              child: Container(
+                margin: const EdgeInsets.all(24),
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  color: cs.surface,
+                  border: Border.all(color: cs.primary),
+                ),
+                child: const Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 20),
+                    Text('> scanning for boards...'),
+                    SizedBox(height: 8),
+                    Text('make sure your ESP is powered on'),
+                  ],
+                ),
               ),
             );
           }
@@ -122,7 +130,7 @@ class _ScanScreenState extends State<ScanScreen> {
                   widget.manager.boards.any((b) => b.id == id);
 
               return ListTile(
-                leading: const Icon(Icons.developer_board),
+                leading: const Icon(Icons.memory_sharp),
                 title: Text(name),
                 subtitle: Text('$id  •  ${r.rssi} dBm'),
                 trailing: busy
@@ -132,13 +140,14 @@ class _ScanScreenState extends State<ScanScreen> {
                         child: CircularProgressIndicator(strokeWidth: 2),
                       )
                     : alreadyAdded
-                        ? const Chip(label: Text('Added'))
-                        : const Icon(Icons.add_circle_outline),
+                        ? const Chip(label: Text('added'))
+                        : const Icon(Icons.add_sharp),
                 onTap: busy ? null : () => _register(r),
               );
             },
           );
         },
+      ),
       ),
       floatingActionButton: StreamBuilder<bool>(
         stream: FlutterBluePlus.isScanning,
@@ -147,8 +156,8 @@ class _ScanScreenState extends State<ScanScreen> {
           final scanning = snap.data ?? false;
           return FloatingActionButton.extended(
             onPressed: scanning ? FlutterBluePlus.stopScan : _startScan,
-            icon: Icon(scanning ? Icons.stop : Icons.search),
-            label: Text(scanning ? 'Stop' : 'Scan again'),
+            icon: Icon(scanning ? Icons.stop_sharp : Icons.search_sharp),
+            label: Text(scanning ? 'stop' : 'scan again'),
           );
         },
       ),

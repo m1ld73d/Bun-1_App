@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'screens/home_screen.dart';
 import 'services/board_manager.dart';
+import 'theme.dart';
 
 void main() => runApp(const LoraApp());
 
@@ -38,11 +39,15 @@ class _LoraAppState extends State<LoraApp> {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'LoRa Chat',
-      theme: ThemeData(colorSchemeSeed: Colors.teal, useMaterial3: true),
+      theme: lightTheme,
+      darkTheme: darkTheme,
+      themeMode: ThemeMode.system,
       home: _loaded
           ? HomeScreen(manager: _manager)
           : const Scaffold(
-              body: Center(child: CircularProgressIndicator()),
+              body: BunnyBackground(
+                child: Center(child: CircularProgressIndicator()),
+              ),
             ),
     );
   }

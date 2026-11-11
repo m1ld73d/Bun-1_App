@@ -39,6 +39,9 @@ class BoardManager extends ChangeNotifier {
   /// Partial-line reassembly buffer.
   final List<int> _buf = [];
 
+  /// Pending rename request, completed when the board acknowledges it.
+  Completer<void>? _renameCompleter;
+
   // ── Public getters ────────────────────────────────────────────────────────
 
   List<Board> get boards => List.unmodifiable(_boards);
@@ -219,8 +222,23 @@ class BoardManager extends ChangeNotifier {
   }
 
   void _handleLine(String line) {
-    // Expected format from ESP: RX|rssi|message text
+    // Expected formats from ESP:
+    //   RX|rssi|message text
+    //   NAME|new name     (rename acknowledged and stored in board NVS)
+    //   NAMEERR|reason    (rename rejected)
     final parts = line.split('|');
+    if (parts[0] == 'NAME' && parts.length >= 2) {
+      _setActiveBoardName(parts.sublist(1).join('|'));
+      _renameCompleter?.complete();
+      _renameCompleter = null;
+      return;
+    }
+    if (parts[0] == 'NAMEERR') {
+      _renameCompleter?.completeError(
+          'Board rejected the name (${parts.length > 1 ? parts[1] : 'error'})');
+      _renameCompleter = null;
+      return;
+    }
     if (parts[0] == 'RX' && parts.length >= 3) {
       final boardId = _activeBoard?.id;
       if (boardId == null) return;
@@ -234,19 +252,72 @@ class BoardManager extends ChangeNotifier {
 
   /// Sends a message over BLE. Throws on write failure so callers can show errors.
   Future<void> sendMessage(String text) async {
-    final board  = _activeBoard;
-    final rx     = _rxChar;
-    final device = _device;
-    if (text.isEmpty || !isConnected || rx == null || device == null || board == null) return;
+    final board = _activeBoard;
+    if (text.isEmpty || !isConnected || board == null) return;
 
     _boardMessages.putIfAbsent(board.id, () => []).add(ChatMessage(true, text));
     notifyListeners();
 
-    final bytes = utf8.encode('$text\n');
+    await _writeLine(text);
+  }
+
+  Future<void> _writeLine(String line) async {
+    final rx     = _rxChar;
+    final device = _device;
+    if (rx == null || device == null) throw 'Not connected';
+
+    final bytes = utf8.encode('$line\n');
     final chunk = max(20, device.mtuNow - 3);
     for (var i = 0; i < bytes.length; i += chunk) {
       await rx.write(bytes.sublist(i, min(i + chunk, bytes.length)));
     }
+  }
+
+  // ── Rename ────────────────────────────────────────────────────────────────
+
+  static const maxNameLength = 20;
+
+  /// Returns an error message, or null if [name] is acceptable to the firmware.
+  static String? validateName(String name) {
+    final n = name.trim();
+    if (n.isEmpty) return 'Name cannot be empty';
+    if (n.length > maxNameLength) return 'Max $maxNameLength characters';
+    if (!RegExp(r'^[\x20-\x7E]+$').hasMatch(n) || n.contains('|')) {
+      return 'Use plain ASCII, no "|"';
+    }
+    return null;
+  }
+
+  /// Renames the connected board. The name is stored in the board's flash
+  /// (NVS), shown on its OLED, and advertised over BLE. Throws if the board is
+  /// not connected, rejects the name, or does not answer in time.
+  Future<void> renameActiveBoard(String newName) async {
+    final name = newName.trim();
+    final error = validateName(name);
+    if (error != null) throw error;
+    if (!isConnected) throw 'Connect to the board first';
+    if (_renameCompleter != null) throw 'Rename already in progress';
+
+    final completer = Completer<void>();
+    _renameCompleter = completer;
+    try {
+      await _writeLine('\x01NAME|$name');
+      await completer.future.timeout(const Duration(seconds: 5),
+          onTimeout: () => throw 'Board did not respond');
+    } finally {
+      if (identical(_renameCompleter, completer)) _renameCompleter = null;
+    }
+  }
+
+  void _setActiveBoardName(String name) {
+    final active = _activeBoard;
+    if (active == null || active.name == name) return;
+    final renamed = Board(id: active.id, name: name);
+    final i = _boards.indexWhere((b) => b.id == active.id);
+    if (i != -1) _boards[i] = renamed;
+    _activeBoard = renamed;
+    _save();
+    notifyListeners();
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────

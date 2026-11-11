@@ -60,6 +60,22 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
+  assets:
+    - assets/Bunny.png
+
+  fonts:
+    - family: JetBrainsMono
+      fonts:
+        - asset: assets/JetBrainsMono-2.304/fonts/ttf/JetBrainsMono-Regular.ttf
+        - asset: assets/JetBrainsMono-2.304/fonts/ttf/JetBrainsMono-Italic.ttf
+          style: italic
+        - asset: assets/JetBrainsMono-2.304/fonts/ttf/JetBrainsMono-Medium.ttf
+          weight: 500
+        - asset: assets/JetBrainsMono-2.304/fonts/ttf/JetBrainsMono-SemiBold.ttf
+          weight: 600
+        - asset: assets/JetBrainsMono-2.304/fonts/ttf/JetBrainsMono-Bold.ttf
+          weight: 700
+
   # To add assets to your application, add an assets section, like this:
   # assets:
   #   - images/a_dot_burr.jpeg

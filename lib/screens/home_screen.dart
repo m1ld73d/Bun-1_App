@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../services/board_manager.dart';
+import '../theme.dart';
 import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
@@ -67,26 +68,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ── Status indicator ───────────────────────────────────────────────────────
 
-  ({IconData icon, Color color, String label}) _statusInfo(
-      ConnectionStatus status, String boardName) {
-    return switch (status) {
-      ConnectionStatus.connected => (
-          icon: Icons.bluetooth_connected,
-          color: Colors.green,
-          label: boardName,
-        ),
-      ConnectionStatus.connecting => (
-          icon: Icons.bluetooth_searching,
-          color: Colors.orange,
-          label: boardName,
-        ),
-      ConnectionStatus.disconnected => (
-          icon: Icons.bluetooth_disabled,
-          color: Colors.grey,
-          label: boardName,
-        ),
-    };
-  }
+  IconData _statusIcon(ConnectionStatus status) => switch (status) {
+        ConnectionStatus.connected => Icons.bluetooth_connected_sharp,
+        ConnectionStatus.connecting => Icons.bluetooth_searching_sharp,
+        ConnectionStatus.disconnected => Icons.bluetooth_disabled_sharp,
+      };
 
   // ── Build ──────────────────────────────────────────────────────────────────
 
@@ -98,15 +84,27 @@ class _HomeScreenState extends State<HomeScreen> {
 
     Widget titleWidget;
     if (board == null) {
-      titleWidget = const Text('No board');
+      titleWidget = Text('No board', style: TextStyle(color: cs.outline));
     } else {
-      final info = _statusInfo(manager.status, board.name);
+      final connected = manager.isConnected;
       titleWidget = Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(info.icon, color: info.color, size: 18),
-          const SizedBox(width: 6),
-          Text(info.label),
+          Icon(_statusIcon(manager.status), size: 18),
+          const SizedBox(width: 8),
+          Flexible(
+            child: Text(board.name, overflow: TextOverflow.ellipsis),
+          ),
+          const SizedBox(width: 8),
+          // filled square = connected, hollow = not
+          Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(
+              color: connected ? cs.primary : Colors.transparent,
+              border: Border.all(color: cs.primary, width: 1.5),
+            ),
+          ),
         ],
       );
     }
@@ -117,7 +115,7 @@ class _HomeScreenState extends State<HomeScreen> {
         title: titleWidget,
         actions: [
           IconButton(
-            icon: const Icon(Icons.settings_outlined),
+            icon: const Icon(Icons.settings_sharp),
             tooltip: 'Settings',
             onPressed: () => Navigator.push(
               context,
@@ -128,18 +126,20 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ],
       ),
-      body: Column(
+      body: BunnyBackground(
+        child: Column(
         children: [
           // ── Chat area ────────────────────────────────────────────────────
           Expanded(
             child: manager.messages.isEmpty
                 ? Center(
                     child: Text(
-                      'Nothing to show yet',
-                      style: Theme.of(context)
-                          .textTheme
-                          .bodyMedium
-                          ?.copyWith(color: cs.outline),
+                      '// Nothing to show yet',
+                      style: TextStyle(
+                        color: cs.onSurface,
+                        fontWeight: FontWeight.w600,
+                        backgroundColor: cs.surface,
+                      ),
                     ),
                   )
                 : ListView.builder(
@@ -167,14 +167,13 @@ class _HomeScreenState extends State<HomeScreen> {
                       onSubmitted: (_) => _send(),
                       decoration: InputDecoration(
                         hintText: manager.isConnected
-                            ? 'LoRa message...'
+                            ? '> message'
                             : board == null
-                                ? 'Add a board in Settings'
+                                ? '> add a board in settings'
                                 : manager.status ==
                                         ConnectionStatus.connecting
-                                    ? 'Connecting…'
-                                    : 'Disconnected',
-                        border: const OutlineInputBorder(),
+                                    ? '> connecting...'
+                                    : '> disconnected',
                         counterText: '',
                       ),
                     ),
@@ -182,13 +181,14 @@ class _HomeScreenState extends State<HomeScreen> {
                   const SizedBox(width: 8),
                   IconButton.filled(
                     onPressed: manager.isConnected ? _send : null,
-                    icon: const Icon(Icons.send),
+                    icon: const Icon(Icons.arrow_forward_sharp),
                   ),
                 ],
               ),
             ),
           ),
         ],
+      ),
       ),
     );
   }
@@ -215,23 +215,25 @@ class _ChatBubble extends StatelessWidget {
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
         constraints:
             BoxConstraints(maxWidth: MediaQuery.of(context).size.width * 0.75),
+        // mine: outlined on page colour; theirs: inverted solid block
         decoration: BoxDecoration(
-          color: m.mine ? cs.primaryContainer : cs.surfaceContainerHighest,
-          borderRadius: BorderRadius.only(
-            topLeft: const Radius.circular(16),
-            topRight: const Radius.circular(16),
-            bottomLeft: Radius.circular(m.mine ? 16 : 4),
-            bottomRight: Radius.circular(m.mine ? 4 : 16),
-          ),
+          color: m.mine ? cs.surface : cs.primary,
+          border: Border.all(color: cs.primary, width: 1),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(m.text),
-            const SizedBox(height: 2),
             Text(
-              '${_hhmm(m.time)}${m.rssi != null ? '  •  ${m.rssi} dBm' : ''}',
-              style: Theme.of(context).textTheme.labelSmall,
+              m.text,
+              style: TextStyle(color: m.mine ? cs.onSurface : cs.onPrimary),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '${_hhmm(m.time)}${m.rssi != null ? '  |  ${m.rssi} dBm' : ''}',
+              style: TextStyle(
+                fontSize: 10,
+                color: m.mine ? cs.outline : cs.onPrimary.withValues(alpha: 0.7),
+              ),
             ),
           ],
         ),

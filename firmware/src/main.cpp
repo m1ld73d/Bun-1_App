@@ -5,6 +5,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 
 // ---------- Piny ----------
 #define PIN_OLED_SDA 4
@@ -18,6 +19,12 @@
 #define PIN_LORA_DI0 26
 #define LORA_FREQUENCY 866E6
 #define MAX_MSG_LEN 100
+#define MAX_NAME_LEN 20
+
+// Linia sterujaca z aplikacji zaczyna sie od 0x01 (zwykle wiadomosci nie).
+//   app -> ESP: <0x01>NAME|<nowa nazwa>
+//   ESP -> app: NAME|<nazwa>   (zapisano)   /   NAMEERR|<powod>
+#define CMD_PREFIX '\x01'
 
 // ---------- BLE: Nordic UART Service ----------
 #define NUS_SERVICE_UUID "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -32,6 +39,9 @@ volatile uint16_t bleChunk = 20;  // MTU - 3
 
 String rxBuf = "";                // bajty odebrane z BLE
 SemaphoreHandle_t rxLock;
+
+Preferences prefs;                // NVS (pamiec nieulotna)
+String boardName;
 
 String lastTx = "-";
 String lastRx = "-";
@@ -80,8 +90,52 @@ void bleBegin(const char* name) {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(NUS_SERVICE_UUID);
   adv->enableScanResponse(true);
+  adv->setName(name);
   adv->start();
 }
+
+// ---------- Nazwa plytki (NVS) ----------
+bool nameValid(const String& n) {
+  if (n.length() < 1 || n.length() > MAX_NAME_LEN) return false;
+  for (size_t i = 0; i < n.length(); i++) {
+    char c = n[i];
+    if (c < 0x20 || c > 0x7E || c == '|') return false;
+  }
+  return true;
+}
+
+String defaultName() {
+  uint32_t id = (uint32_t)(ESP.getEfuseMac() >> 24) & 0xFFFF;
+  return "LoRaNode-" + String(id, HEX);
+}
+
+void loadName() {
+  prefs.begin("bun1", true);
+  boardName = prefs.getString("name", "");
+  prefs.end();
+  if (!nameValid(boardName)) boardName = defaultName();
+}
+
+// Zapisuje nazwe w NVS i odswieza reklamowana nazwe BLE.
+// Nowa nazwa jest widoczna w skanie po rozlaczeniu (podczas polaczenia
+// reklamowanie jest zatrzymane i startuje ponownie w onDisconnect).
+void applyName(const String& n) {
+  boardName = n;
+  prefs.begin("bun1", false);
+  prefs.putString("name", boardName);
+  prefs.end();
+
+  NimBLEDevice::setDeviceName(boardName.c_str());
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->setName(boardName.c_str());
+  if (adv->isAdvertising()) {
+    adv->stop();
+    adv->start();
+  }
+  screenDirty = true;
+  Serial.println("Nowa nazwa: " + boardName);
+}
+
 
 // Wysyła linię do aplikacji w kawałkach <= MTU-3
 void bleSendLine(const String& s) {
@@ -111,10 +165,25 @@ String bleReadLine() {
   return line;
 }
 
+void handleCommand(String cmd) {
+  // cmd bez znaku CMD_PREFIX
+  if (cmd.startsWith("NAME|")) {
+    String n = cmd.substring(5);
+    n.trim();
+    if (!nameValid(n)) {
+      bleSendLine("NAMEERR|invalid");
+      return;
+    }
+    applyName(n);
+    bleSendLine("NAME|" + boardName);
+  }
+}
+
 // ---------- OLED ----------
 void drawScreen() {
   display.clearDisplay();
   display.setCursor(0, 0);
+  display.println(boardName.substring(0, 21));
   display.println(bleConnected ? "BLE: polaczono" : "BLE: czekam...");
   display.println("---------------------");
   display.println("TX:");
@@ -178,16 +247,17 @@ void setup() {
   }
 
   // BLE
-  uint32_t id = (uint32_t)(ESP.getEfuseMac() >> 24) & 0xFFFF;
-  String name = "LoRaNode-" + String(id, HEX);
-  bleBegin(name.c_str());
-  Serial.println("BLE: " + name);
+  loadName();
+  bleBegin(boardName.c_str());
+  Serial.println("BLE: " + boardName);
 }
 
 void loop() {
   // wiadomość z aplikacji -> LoRa
   String line = bleReadLine();
-  if (line.length() > 0) {
+  if (line.length() > 0 && line[0] == CMD_PREFIX) {
+    handleCommand(line.substring(1));
+  } else if (line.length() > 0) {
     if (line.length() > MAX_MSG_LEN) line = line.substring(0, MAX_MSG_LEN);
     loraSend(line);
   }
