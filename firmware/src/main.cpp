@@ -18,7 +18,7 @@
 #define PIN_LORA_RST 14
 #define PIN_LORA_DI0 26
 #define LORA_FREQUENCY 866E6
-#define MAX_MSG_LEN 100
+#define MAX_MSG_LEN 224  // hex szyfrogramu AES (max 224 znaki, limit pakietu LoRa 255)
 #define MAX_NAME_LEN 20
 
 // Linia sterujaca z aplikacji zaczyna sie od 0x01 (zwykle wiadomosci nie).

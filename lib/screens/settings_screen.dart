@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../services/board_manager.dart';
+import '../services/crypto_service.dart';
 import '../models/board.dart';
 import '../theme.dart';
 import 'scan_screen.dart';
@@ -54,92 +56,44 @@ class _SettingsScreenState extends State<SettingsScreen> {
   }
 
   Future<void> _rename(Board board) async {
-    final ctrl = TextEditingController(text: board.name);
-    String? error;
-    bool busy = false;
-
-    await showDialog<void>(
+    // The dialog owns its text controller (see _RenameDialog) and talks to
+    // the board itself; it returns true when the new name was saved.
+    final saved = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => StatefulBuilder(
-        builder: (ctx, setLocal) {
-          Future<void> submit() async {
-            final name = ctrl.text.trim();
-            final invalid = BoardManager.validateName(name);
-            if (invalid != null) {
-              setLocal(() => error = invalid);
-              return;
-            }
-            if (name == board.name) {
-              Navigator.pop(ctx);
-              return;
-            }
-            setLocal(() {
-              busy = true;
-              error = null;
-            });
-            try {
-              await widget.manager.renameActiveBoard(name);
-              if (ctx.mounted) Navigator.pop(ctx);
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-                  content: Text('Saved on board. New name is advertised '
-                      'after the next disconnect.'),
-                ));
-              }
-            } catch (e) {
-              setLocal(() {
-                busy = false;
-                error = '$e';
-              });
-            }
-          }
-
-          return AlertDialog(
-            title: const Text('rename board'),
-            content: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                TextField(
-                  controller: ctrl,
-                  autofocus: true,
-                  enabled: !busy,
-                  maxLength: BoardManager.maxNameLength,
-                  onSubmitted: (_) => submit(),
-                  decoration: InputDecoration(
-                    hintText: '> name',
-                    errorText: error,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                const Text(
-                  'stored in board memory and shown on its OLED',
-                  style: TextStyle(fontSize: 11),
-                ),
-              ],
-            ),
-            actions: [
-              TextButton(
-                onPressed: busy ? null : () => Navigator.pop(ctx),
-                child: const Text('cancel'),
-              ),
-              FilledButton(
-                onPressed: busy ? null : submit,
-                child: busy
-                    ? const SizedBox(
-                        width: 16,
-                        height: 16,
-                        child: CircularProgressIndicator(strokeWidth: 2),
-                      )
-                    : const Text('save'),
-              ),
-            ],
-          );
-        },
+      builder: (_) => _RenameDialog(
+        manager: widget.manager,
+        initialName: board.name,
       ),
     );
-    ctrl.dispose();
+    if (saved == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Saved on board. New name is advertised '
+            'after the next disconnect.'),
+      ));
+    }
+  }
+
+  Future<void> _editKey() async {
+    // The dialog owns its text controller and only returns the key; saving
+    // happens after it is closed, so nothing rebuilds underneath it.
+    final key = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _KeyDialog(initialKey: widget.manager.aesKeyHex),
+    );
+    if (key == null || !mounted) return;
+
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      await widget.manager.setAesKey(key);
+      messenger.showSnackBar(const SnackBar(
+        content: Text('Key saved. Every device must use the '
+            'same key to read your messages.'),
+      ));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('Could not save key: $e')));
+    }
   }
 
   // ── Status helpers ─────────────────────────────────────────────────────────
@@ -214,6 +168,50 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 builder: (_) => ScanScreen(manager: manager),
               ),
             ),
+          ),
+
+          // ── Encryption section ─────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+            child: Text(
+              '// encryption',
+              style: TextStyle(
+                  color: cs.onSurface, fontWeight: FontWeight.w700),
+            ),
+          ),
+          ListTile(
+            leading: _IconBox(
+                icon: Icons.lock_sharp, active: !manager.usesDefaultKey),
+            title: const Text('aes-256 key'),
+            subtitle: Text(
+              manager.usesDefaultKey
+                  ? 'default key (public) - set your own'
+                  : 'custom key  ${manager.aesKeyHex.substring(0, 4)}'
+                      '...${manager.aesKeyHex.substring(60)}',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelSmall
+                  ?.copyWith(color: cs.outline),
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.edit_sharp),
+              tooltip: 'Edit encryption key',
+              onPressed: _editKey,
+            ),
+            onTap: _editKey,
+          ),
+          SwitchListTile(
+            secondary: const _IconBox(icon: Icons.visibility_sharp, active: false),
+            title: const Text('show undecryptable'),
+            subtitle: Text(
+              'show messages that failed to decrypt',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelSmall
+                  ?.copyWith(color: cs.outline),
+            ),
+            value: manager.showUndecryptable,
+            onChanged: manager.setShowUndecryptable,
           ),
 
           const SizedBox(height: 24),
@@ -327,6 +325,210 @@ class _BoardTile extends StatelessWidget {
         ],
       ),
       onTap: onTap,
+    );
+  }
+}
+
+// ── Encryption key dialog ──────────────────────────────────────────────────────
+
+class _KeyDialog extends StatefulWidget {
+  final String initialKey;
+  const _KeyDialog({required this.initialKey});
+
+  @override
+  State<_KeyDialog> createState() => _KeyDialogState();
+}
+
+class _KeyDialogState extends State<_KeyDialog> {
+  late final TextEditingController _ctrl =
+      TextEditingController(text: widget.initialKey);
+  String? _error;
+  bool _copied = false;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _save() {
+    final key = _ctrl.text.trim();
+    final error = MessageCrypto.validateKey(key);
+    if (error != null) {
+      setState(() => _error = error);
+      return;
+    }
+    Navigator.pop(context, key);
+  }
+
+  Future<void> _copy() async {
+    await Clipboard.setData(ClipboardData(text: _ctrl.text.trim()));
+    if (!mounted) return;
+    setState(() => _copied = true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('encryption key'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _ctrl,
+              autofocus: true,
+              maxLength: 64,
+              minLines: 2,
+              maxLines: 3,
+              inputFormatters: [
+                FilteringTextInputFormatter.allow(RegExp('[0-9a-fA-F]')),
+              ],
+              onChanged: (_) {
+                if (_error != null || _copied) {
+                  setState(() {
+                    _error = null;
+                    _copied = false;
+                  });
+                }
+              },
+              decoration: InputDecoration(
+                hintText: '> 64 hex characters',
+                errorText: _error,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Wrap(
+              spacing: 8,
+              children: [
+                TextButton(
+                  onPressed: () => setState(() {
+                    _ctrl.text = MessageCrypto.generateKey();
+                    _error = null;
+                    _copied = false;
+                  }),
+                  child: const Text('generate'),
+                ),
+                TextButton(
+                  onPressed: _copy,
+                  child: Text(_copied ? 'copied' : 'copy'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'AES-256, 64 hex characters. All devices that should '
+              'read your messages need the same key.',
+              style: TextStyle(fontSize: 11),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('cancel'),
+        ),
+        FilledButton(onPressed: _save, child: const Text('save')),
+      ],
+    );
+  }
+}
+
+// ── Rename dialog ──────────────────────────────────────────────────────────────
+
+class _RenameDialog extends StatefulWidget {
+  final BoardManager manager;
+  final String initialName;
+  const _RenameDialog({required this.manager, required this.initialName});
+
+  @override
+  State<_RenameDialog> createState() => _RenameDialogState();
+}
+
+class _RenameDialogState extends State<_RenameDialog> {
+  late final TextEditingController _ctrl =
+      TextEditingController(text: widget.initialName);
+  String? _error;
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final name = _ctrl.text.trim();
+    final invalid = BoardManager.validateName(name);
+    if (invalid != null) {
+      setState(() => _error = invalid);
+      return;
+    }
+    if (name == widget.initialName) {
+      Navigator.pop(context, false);
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.manager.renameActiveBoard(name);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$e';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('rename board'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _ctrl,
+            autofocus: true,
+            enabled: !_busy,
+            maxLength: BoardManager.maxNameLength,
+            onSubmitted: (_) => _submit(),
+            decoration: InputDecoration(
+              hintText: '> name',
+              errorText: _error,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'stored in board memory and shown on its OLED',
+            style: TextStyle(fontSize: 11),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context, false),
+          child: const Text('cancel'),
+        ),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          child: _busy
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('save'),
+        ),
+      ],
     );
   }
 }

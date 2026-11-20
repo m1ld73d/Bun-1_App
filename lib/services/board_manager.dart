@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../constants.dart';
 import '../models/board.dart';
+import 'crypto_service.dart';
 
 class ChatMessage {
   final bool mine;
@@ -42,12 +43,23 @@ class BoardManager extends ChangeNotifier {
   /// Pending rename request, completed when the board acknowledges it.
   Completer<void>? _renameCompleter;
 
+  /// AES-256 key (64 hex chars) used to encrypt/decrypt messages in the app.
+  String _aesKeyHex = MessageCrypto.defaultKeyHex;
+
+  /// Whether received messages that could not be decrypted are shown in the
+  /// chat (as "[decrypt failed] <raw text>") or silently dropped.
+  bool _showUndecryptable = true;
+
   // ── Public getters ────────────────────────────────────────────────────────
 
   List<Board> get boards => List.unmodifiable(_boards);
   Board? get activeBoard => _activeBoard;
   ConnectionStatus get status => _status;
   bool get isConnected => _status == ConnectionStatus.connected;
+
+  String get aesKeyHex => _aesKeyHex;
+  bool get usesDefaultKey => _aesKeyHex == MessageCrypto.defaultKeyHex;
+  bool get showUndecryptable => _showUndecryptable;
 
   List<ChatMessage> get messages =>
       _activeBoard != null ? (_boardMessages[_activeBoard!.id] ?? const []) : const [];
@@ -56,6 +68,12 @@ class BoardManager extends ChangeNotifier {
 
   Future<void> load() async {
     final prefs = await SharedPreferences.getInstance();
+
+    final savedKey = prefs.getString('aesKey');
+    if (savedKey != null && MessageCrypto.validateKey(savedKey) == null) {
+      _aesKeyHex = savedKey.toLowerCase();
+    }
+    _showUndecryptable = prefs.getBool('showUndecryptable') ?? true;
 
     final raw = prefs.getStringList('boards') ?? [];
     _boards.addAll(
@@ -242,10 +260,17 @@ class BoardManager extends ChangeNotifier {
     if (parts[0] == 'RX' && parts.length >= 3) {
       final boardId = _activeBoard?.id;
       if (boardId == null) return;
+      // The board forwards the raw LoRa payload (hex ciphertext).
+      final raw = parts.sublist(2).join('|');
+      var text = MessageCrypto.decrypt(raw, _aesKeyHex);
+      if (text == null) {
+        // Could not be decrypted (wrong key, or sent without encryption).
+        if (!_showUndecryptable) return;
+        text = '[decrypt failed] $raw';
+      }
       _boardMessages
           .putIfAbsent(boardId, () => [])
-          .add(ChatMessage(false, parts.sublist(2).join('|'),
-              rssi: int.tryParse(parts[1])));
+          .add(ChatMessage(false, text, rssi: int.tryParse(parts[1])));
       notifyListeners();
     }
   }
@@ -255,10 +280,37 @@ class BoardManager extends ChangeNotifier {
     final board = _activeBoard;
     if (text.isEmpty || !isConnected || board == null) return;
 
+    // Encrypt first, so a too-long message is rejected before it shows up in
+    // the chat. The board just forwards this hex string over LoRa.
+    final encrypted = MessageCrypto.encrypt(text, _aesKeyHex);
+
     _boardMessages.putIfAbsent(board.id, () => []).add(ChatMessage(true, text));
     notifyListeners();
 
-    await _writeLine(text);
+    await _writeLine(encrypted);
+  }
+
+  // ── Encryption key ────────────────────────────────────────────────────────
+
+  /// Turns the display of undecryptable messages on or off (saved).
+  Future<void> setShowUndecryptable(bool value) async {
+    _showUndecryptable = value;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('showUndecryptable', value);
+  }
+
+  /// Saves a new AES-256 key (64 hex chars). Every device that should read
+  /// your messages needs the same key. Throws a message if [hex] is invalid.
+  Future<void> setAesKey(String hex) async {
+    final key = hex.trim().toLowerCase();
+    final error = MessageCrypto.validateKey(key);
+    if (error != null) throw error;
+
+    _aesKeyHex = key;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('aesKey', key);
+    notifyListeners();
   }
 
   Future<void> _writeLine(String line) async {
