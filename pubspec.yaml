@@ -38,6 +38,7 @@ dependencies:
   permission_handler: ^13.0.2
   shared_preferences: ^2.3.2
   pointycastle: ^3.9.1
+  cryptography: ^2.7.0
 
 dev_dependencies:
   flutter_test:

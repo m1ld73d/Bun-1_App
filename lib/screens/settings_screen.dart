@@ -3,7 +3,9 @@ import 'package:flutter/services.dart';
 
 import '../services/board_manager.dart';
 import '../services/crypto_service.dart';
+import '../services/identity_crypto.dart';
 import '../models/board.dart';
+import '../models/contact.dart';
 import '../theme.dart';
 import 'scan_screen.dart';
 
@@ -71,6 +73,64 @@ class _SettingsScreenState extends State<SettingsScreen> {
         content: Text('Saved on board. New name is advertised '
             'after the next disconnect.'),
       ));
+    }
+  }
+
+  Future<void> _editUsername() async {
+    final saved = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _UsernameDialog(
+        manager: widget.manager,
+        initialName: widget.manager.username,
+      ),
+    );
+    if (saved == true && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Username saved. Contacts see it on your next message.'),
+      ));
+    }
+  }
+
+  Future<void> _addContact() async {
+    final manager = widget.manager;
+    // Pairing is started here, not inside the dialog, so listeners are not
+    // notified while the dialog is being built.
+    manager.startPairing();
+    final name = await showDialog<String>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _PairDialog(manager: manager),
+    );
+    manager.stopPairing();
+    if (name != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Added contact "$name"')),
+      );
+    }
+  }
+
+  Future<void> _confirmRemoveContact(Contact contact) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove contact?'),
+        content: Text('Remove "${contact.name}"? You will not be able to '
+            'read their messages until you pair again.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true) {
+      await widget.manager.removeContact(contact);
     }
   }
 
@@ -168,6 +228,77 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 builder: (_) => ScanScreen(manager: manager),
               ),
             ),
+          ),
+
+          // ── Account section ────────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+            child: Text(
+              '// account',
+              style: TextStyle(
+                  color: cs.onSurface, fontWeight: FontWeight.w700),
+            ),
+          ),
+          ListTile(
+            leading: const _IconBox(icon: Icons.person_sharp, active: true),
+            title: Text(manager.username),
+            subtitle: Text(
+              'username - id ${manager.myIdHex}',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelSmall
+                  ?.copyWith(color: cs.outline),
+            ),
+            trailing: IconButton(
+              icon: const Icon(Icons.edit_sharp),
+              tooltip: 'Change username',
+              onPressed: _editUsername,
+            ),
+            onTap: _editUsername,
+          ),
+
+          // ── Contacts section ───────────────────────────────────────────────
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 20, 16, 8),
+            child: Text(
+              '// contacts',
+              style: TextStyle(
+                  color: cs.onSurface, fontWeight: FontWeight.w700),
+            ),
+          ),
+          if (manager.contacts.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+              child: Text(
+                'No contacts yet.',
+                style: TextStyle(color: cs.outline),
+              ),
+            ),
+          ...manager.contacts.map((c) => ListTile(
+                leading: const _IconBox(
+                    icon: Icons.person_outline_sharp, active: false),
+                title: Text(c.name),
+                subtitle: Text(
+                  'id ${c.idHex}',
+                  style: Theme.of(context)
+                      .textTheme
+                      .labelSmall
+                      ?.copyWith(color: cs.outline),
+                ),
+                trailing: IconButton(
+                  icon: const Icon(Icons.close_sharp),
+                  tooltip: 'Remove contact',
+                  onPressed: () => _confirmRemoveContact(c),
+                ),
+              )),
+          ListTile(
+            leading: const _IconBox(icon: Icons.add_sharp, active: false),
+            title: const Text('+ add contact'),
+            subtitle: Text(manager.isConnected
+                ? 'pair with a nearby device (4-digit code)'
+                : 'connect to a board first'),
+            enabled: manager.isConnected,
+            onTap: manager.isConnected ? _addContact : null,
           ),
 
           // ── Encryption section ─────────────────────────────────────────────
@@ -528,6 +659,226 @@ class _RenameDialogState extends State<_RenameDialog> {
                 )
               : const Text('save'),
         ),
+      ],
+    );
+  }
+}
+
+// ── Username dialog ────────────────────────────────────────────────────────────
+
+class _UsernameDialog extends StatefulWidget {
+  final BoardManager manager;
+  final String initialName;
+  const _UsernameDialog({required this.manager, required this.initialName});
+
+  @override
+  State<_UsernameDialog> createState() => _UsernameDialogState();
+}
+
+class _UsernameDialogState extends State<_UsernameDialog> {
+  late final TextEditingController _ctrl =
+      TextEditingController(text: widget.initialName);
+  String? _error;
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final name = _ctrl.text.trim();
+    final invalid = IdentityCrypto.validateName(name);
+    if (invalid != null) {
+      setState(() => _error = invalid);
+      return;
+    }
+    if (name == widget.initialName) {
+      Navigator.pop(context, false);
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.manager.setUsername(name);
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$e';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('username'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _ctrl,
+            autofocus: true,
+            enabled: !_busy,
+            maxLength: IdentityCrypto.maxNameBytes,
+            onSubmitted: (_) => _submit(),
+            decoration: InputDecoration(
+              hintText: '> name',
+              errorText: _error,
+            ),
+          ),
+          const SizedBox(height: 4),
+          const Text(
+            'shown next to your messages for people who have you as a contact',
+            style: TextStyle(fontSize: 11),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context, false),
+          child: const Text('cancel'),
+        ),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          child: const Text('save'),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Pairing dialog ─────────────────────────────────────────────────────────────
+
+class _PairDialog extends StatefulWidget {
+  final BoardManager manager;
+  const _PairDialog({required this.manager});
+
+  @override
+  State<_PairDialog> createState() => _PairDialogState();
+}
+
+class _PairDialogState extends State<_PairDialog> {
+  bool _busy = false;
+  String? _error;
+
+  BoardManager get _m => widget.manager;
+
+  @override
+  void initState() {
+    super.initState();
+    _m.addListener(_onChange);
+  }
+
+  @override
+  void dispose() {
+    _m.removeListener(_onChange);
+    super.dispose();
+  }
+
+  void _onChange() {
+    if (mounted) setState(() {});
+  }
+
+  Future<void> _confirm() async {
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final name = await _m.confirmPairPeer();
+      if (mounted) Navigator.pop(context, name);
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+          _error = '$e';
+        });
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final peer = _m.pairPeer;
+    final code = _m.pairCode;
+
+    return AlertDialog(
+      title: const Text('add contact'),
+      content: peer == null || code == null
+          ? Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: const [
+                Row(
+                  children: [
+                    SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    SizedBox(width: 12),
+                    Expanded(child: Text('looking for a nearby device...')),
+                  ],
+                ),
+                SizedBox(height: 12),
+                Text(
+                  'Open "add contact" on the other phone too. Both boards '
+                  'must be connected and in radio range.',
+                  style: TextStyle(fontSize: 11),
+                ),
+              ],
+            )
+          : Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('found: ${peer.name.isEmpty ? '(no name)' : peer.name}'),
+                const SizedBox(height: 12),
+                Center(
+                  child: Text(
+                    code,
+                    style: const TextStyle(
+                      fontSize: 36,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 6,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                const Text(
+                  'Check that the other phone shows the same code, then '
+                  'confirm. If the codes differ, reject.',
+                  style: TextStyle(fontSize: 11),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 8),
+                  Text(_error!),
+                ],
+              ],
+            ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.pop(context),
+          child: const Text('cancel'),
+        ),
+        if (peer != null && code != null) ...[
+          TextButton(
+            onPressed: _busy ? null : _m.rejectPairPeer,
+            child: const Text('reject'),
+          ),
+          FilledButton(
+            onPressed: _busy ? null : _confirm,
+            child: const Text('confirm'),
+          ),
+        ],
       ],
     );
   }

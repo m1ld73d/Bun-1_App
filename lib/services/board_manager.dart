@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -9,15 +10,22 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../constants.dart';
 import '../models/board.dart';
+import '../models/contact.dart';
 import 'crypto_service.dart';
+import 'identity_crypto.dart';
 
 class ChatMessage {
   final bool mine;
   final String text;
   final int? rssi;
+
+  /// Sender's name (received messages) or recipient's name (sent messages);
+  /// null when unknown, e.g. a message sent with the shared key.
+  final String? label;
   final DateTime time;
 
-  ChatMessage(this.mine, this.text, {this.rssi}) : time = DateTime.now();
+  ChatMessage(this.mine, this.text, {this.rssi, this.label})
+      : time = DateTime.now();
 }
 
 enum ConnectionStatus { disconnected, connecting, connected }
@@ -50,6 +58,24 @@ class BoardManager extends ChangeNotifier {
   /// chat (as "[decrypt failed] <raw text>") or silently dropped.
   bool _showUndecryptable = true;
 
+  // ── Account, contacts, pairing ────────────────────────────────────────────
+
+  /// Private key of this user (32 bytes) and the matching public key.
+  Uint8List? _seed;
+  Uint8List? _myPub;
+  String _username = '';
+
+  final List<Contact> _contacts = [];
+
+  /// Key id (hex) of the contact messages are sent to; null = everyone,
+  /// using the shared AES key.
+  String? _recipientId;
+
+  bool _pairing = false;
+  Timer? _pairTimer;
+  Hello? _pairPeer;
+  final Set<String> _rejectedPeers = {};
+
   // ── Public getters ────────────────────────────────────────────────────────
 
   List<Board> get boards => List.unmodifiable(_boards);
@@ -60,6 +86,34 @@ class BoardManager extends ChangeNotifier {
   String get aesKeyHex => _aesKeyHex;
   bool get usesDefaultKey => _aesKeyHex == MessageCrypto.defaultKeyHex;
   bool get showUndecryptable => _showUndecryptable;
+
+  String get username => _username;
+
+  /// Short id of this account (8 hex chars); contacts see the same id.
+  String get myIdHex =>
+      _myPub == null ? '' : IdentityCrypto.keyIdHex(_myPub!);
+
+  List<Contact> get contacts => List.unmodifiable(_contacts);
+
+  /// Contact that messages are sent to, or null for "everyone" (shared key).
+  Contact? get recipient {
+    final id = _recipientId;
+    if (id == null) return null;
+    for (final c in _contacts) {
+      if (c.idHex == id) return c;
+    }
+    return null;
+  }
+
+  bool get pairing => _pairing;
+
+  /// Device found while pairing, waiting for the 4-digit code check.
+  Hello? get pairPeer => _pairPeer;
+
+  /// 4-digit code both devices must show for the same pairing.
+  String? get pairCode => (_pairPeer != null && _myPub != null)
+      ? IdentityCrypto.sas(_myPub!, _pairPeer!.pub)
+      : null;
 
   List<ChatMessage> get messages =>
       _activeBoard != null ? (_boardMessages[_activeBoard!.id] ?? const []) : const [];
@@ -74,6 +128,32 @@ class BoardManager extends ChangeNotifier {
       _aesKeyHex = savedKey.toLowerCase();
     }
     _showUndecryptable = prefs.getBool('showUndecryptable') ?? true;
+
+    // Account: the private key is created on first launch.
+    final seedB64 = prefs.getString('idSeed');
+    Uint8List? seed;
+    if (seedB64 != null) {
+      try {
+        final s = base64.decode(seedB64);
+        if (s.length == 32) seed = s;
+      } catch (_) {}
+    }
+    if (seed == null) {
+      seed = IdentityCrypto.generateSeed();
+      await prefs.setString('idSeed', base64.encode(seed));
+    }
+    _seed = seed;
+    _myPub = await IdentityCrypto.publicKey(seed);
+    _username = prefs.getString('username') ??
+        'user-${IdentityCrypto.keyIdHex(_myPub!).substring(0, 4)}';
+
+    for (final s in prefs.getStringList('contacts') ?? const <String>[]) {
+      try {
+        _contacts
+            .add(Contact.fromJson(jsonDecode(s) as Map<String, dynamic>));
+      } catch (_) {}
+    }
+    _recipientId = prefs.getString('recipient');
 
     final raw = prefs.getStringList('boards') ?? [];
     _boards.addAll(
@@ -258,36 +338,254 @@ class BoardManager extends ChangeNotifier {
       return;
     }
     if (parts[0] == 'RX' && parts.length >= 3) {
-      final boardId = _activeBoard?.id;
-      if (boardId == null) return;
-      // The board forwards the raw LoRa payload (hex ciphertext).
-      final raw = parts.sublist(2).join('|');
-      var text = MessageCrypto.decrypt(raw, _aesKeyHex);
-      if (text == null) {
-        // Could not be decrypted (wrong key, or sent without encryption).
-        if (!_showUndecryptable) return;
-        text = '[decrypt failed] $raw';
-      }
-      _boardMessages
-          .putIfAbsent(boardId, () => [])
-          .add(ChatMessage(false, text, rssi: int.tryParse(parts[1])));
-      notifyListeners();
+      // ignore: unawaited_futures
+      _handleRx(int.tryParse(parts[1]), parts.sublist(2).join('|'));
     }
   }
 
-  /// Sends a message over BLE. Throws on write failure so callers can show errors.
+  /// Handles one LoRa payload forwarded by the board. Payload kinds:
+  ///   `#H...`  hello from a device that is pairing
+  ///   `#M...`  message encrypted for one contact (X25519 + AES-GCM)
+  ///   other    hex ciphertext made with the shared AES key (older format)
+  Future<void> _handleRx(int? rssi, String payload) async {
+    final boardId = _activeBoard?.id;
+    if (boardId == null) return;
+
+    if (payload.startsWith('#H')) {
+      _onHello(payload);
+      return;
+    }
+
+    String? text;
+    String? label;
+
+    if (payload.startsWith('#M')) {
+      final packet = IdentityCrypto.parseMessage(payload);
+      final myPub = _myPub;
+      final seed = _seed;
+      if (packet != null && myPub != null && seed != null) {
+        // Radio is broadcast: ignore messages meant for other people.
+        if (!IdentityCrypto.sameBytes(
+            packet.recipientId, IdentityCrypto.keyId(myPub))) {
+          return;
+        }
+        Contact? sender;
+        for (final c in _contacts) {
+          if (IdentityCrypto.sameBytes(
+              IdentityCrypto.keyId(c.pub), packet.senderId)) {
+            sender = c;
+            break;
+          }
+        }
+        if (sender != null) {
+          final m = await IdentityCrypto.decryptMessage(
+            seed: seed,
+            myPub: myPub,
+            theirPub: sender.pub,
+            packet: packet,
+          );
+          if (m != null) {
+            text = m.text;
+            label = m.name.isEmpty ? sender.name : m.name;
+            if (m.name.isNotEmpty && m.name != sender.name) {
+              _updateContactName(sender, m.name);
+            }
+          }
+        }
+      }
+    } else {
+      text = MessageCrypto.decrypt(payload, _aesKeyHex);
+    }
+
+    if (text == null) {
+      // Wrong key, unknown sender, damaged, or sent without encryption.
+      if (!_showUndecryptable) return;
+      text = '[decrypt failed] $payload';
+    }
+    if (_activeBoard?.id != boardId) return; // board changed while decrypting
+
+    _boardMessages
+        .putIfAbsent(boardId, () => [])
+        .add(ChatMessage(false, text, rssi: rssi, label: label));
+    notifyListeners();
+  }
+
+  /// Sends a message over BLE. Throws on failure so callers can show errors.
+  /// With a contact selected it is encrypted for that contact only;
+  /// otherwise the shared AES key is used.
   Future<void> sendMessage(String text) async {
     final board = _activeBoard;
     if (text.isEmpty || !isConnected || board == null) return;
 
     // Encrypt first, so a too-long message is rejected before it shows up in
-    // the chat. The board just forwards this hex string over LoRa.
-    final encrypted = MessageCrypto.encrypt(text, _aesKeyHex);
+    // the chat. The board just forwards this text over LoRa.
+    final to = recipient;
+    final String payload;
+    final String label;
+    if (to == null) {
+      payload = MessageCrypto.encrypt(text, _aesKeyHex);
+      label = 'everyone';
+    } else {
+      final seed = _seed;
+      final myPub = _myPub;
+      if (seed == null || myPub == null) throw 'Account is not ready yet';
+      payload = await IdentityCrypto.encryptMessage(
+        seed: seed,
+        myPub: myPub,
+        theirPub: to.pub,
+        name: _username,
+        text: text,
+      );
+      label = to.name;
+    }
 
-    _boardMessages.putIfAbsent(board.id, () => []).add(ChatMessage(true, text));
+    _boardMessages
+        .putIfAbsent(board.id, () => [])
+        .add(ChatMessage(true, text, label: label));
     notifyListeners();
 
-    await _writeLine(encrypted);
+    await _writeLine(payload);
+  }
+
+  // ── Account and contacts ──────────────────────────────────────────────────
+
+  /// Changes the username other people see next to your messages.
+  Future<void> setUsername(String name) async {
+    final error = IdentityCrypto.validateName(name);
+    if (error != null) throw error;
+    _username = name.trim();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('username', _username);
+    notifyListeners();
+  }
+
+  /// Selects who messages are sent to; null = everyone (shared key).
+  Future<void> setRecipient(Contact? contact) async {
+    _recipientId = contact?.idHex;
+    notifyListeners();
+    final prefs = await SharedPreferences.getInstance();
+    if (_recipientId == null) {
+      await prefs.remove('recipient');
+    } else {
+      await prefs.setString('recipient', _recipientId!);
+    }
+  }
+
+  Future<void> removeContact(Contact contact) async {
+    _contacts.removeWhere((c) => IdentityCrypto.sameBytes(c.pub, contact.pub));
+    if (_recipientId == contact.idHex) _recipientId = null;
+    await _saveContacts();
+    notifyListeners();
+  }
+
+  void _updateContactName(Contact contact, String name) {
+    final i =
+        _contacts.indexWhere((c) => IdentityCrypto.sameBytes(c.pub, contact.pub));
+    if (i == -1) return;
+    _contacts[i] = contact.withName(name);
+    // ignore: unawaited_futures
+    _saveContacts();
+  }
+
+  Future<void> _saveContacts() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      'contacts',
+      _contacts.map((c) => jsonEncode(c.toJson())).toList(),
+    );
+    if (_recipientId == null) {
+      await prefs.remove('recipient');
+    } else {
+      await prefs.setString('recipient', _recipientId!);
+    }
+  }
+
+  // ── Pairing ───────────────────────────────────────────────────────────────
+  //
+  // Both people open "add contact". Each device broadcasts a hello with its
+  // public key. When a hello arrives, both devices show the same 4-digit code;
+  // if the people agree it matches, each confirms and saves the other as a
+  // contact. Nothing secret is sent over the air - only public keys.
+
+  void startPairing() {
+    if (_pairing) return;
+    _pairing = true;
+    _pairPeer = null;
+    _rejectedPeers.clear();
+    _sendHello();
+    _scheduleHello();
+    notifyListeners();
+  }
+
+  void _scheduleHello() {
+    _pairTimer?.cancel();
+    // Random delay so two devices do not keep colliding on the same instant.
+    final ms = 3000 + Random().nextInt(3000);
+    _pairTimer = Timer(Duration(milliseconds: ms), () {
+      if (!_pairing) return;
+      _sendHello();
+      _scheduleHello();
+    });
+  }
+
+  void _sendHello() {
+    final pub = _myPub;
+    if (pub == null || !isConnected) return;
+    _writeLine(IdentityCrypto.helloPayload(pub, _username)).catchError((_) {});
+  }
+
+  void _onHello(String payload) {
+    if (!_pairing || _pairPeer != null) return;
+    final hello = IdentityCrypto.parseHello(payload);
+    final myPub = _myPub;
+    if (hello == null || myPub == null) return;
+    if (IdentityCrypto.sameBytes(hello.pub, myPub)) return;
+    if (_rejectedPeers.contains(IdentityCrypto.keyIdHex(hello.pub))) return;
+    _pairPeer = hello;
+    notifyListeners();
+  }
+
+  /// Stops pairing. Pass `notify: false` when called while a widget is being
+  /// disposed (notifying then would rebuild other widgets mid-teardown).
+  void stopPairing({bool notify = true}) {
+    if (!_pairing && _pairPeer == null) return;
+    _pairing = false;
+    _pairTimer?.cancel();
+    _pairTimer = null;
+    _pairPeer = null;
+    if (notify) notifyListeners();
+  }
+
+  /// The codes did not match: ignore this device and keep looking.
+  void rejectPairPeer() {
+    final peer = _pairPeer;
+    if (peer == null) return;
+    _rejectedPeers.add(IdentityCrypto.keyIdHex(peer.pub));
+    _pairPeer = null;
+    notifyListeners();
+  }
+
+  /// The codes matched: save the other device as a contact and stop pairing.
+  /// Returns the contact's name.
+  Future<String> confirmPairPeer() async {
+    final peer = _pairPeer;
+    if (peer == null) throw 'No device to pair with';
+    final name = peer.name.trim().isEmpty
+        ? 'user-${IdentityCrypto.keyIdHex(peer.pub).substring(0, 4)}'
+        : peer.name.trim();
+    final contact = Contact(name: name, pub: peer.pub);
+
+    final i =
+        _contacts.indexWhere((c) => IdentityCrypto.sameBytes(c.pub, peer.pub));
+    if (i == -1) {
+      _contacts.add(contact);
+    } else {
+      _contacts[i] = contact;
+    }
+    stopPairing(notify: false);
+    await _saveContacts();
+    notifyListeners();
+    return name;
   }
 
   // ── Encryption key ────────────────────────────────────────────────────────
@@ -376,6 +674,7 @@ class BoardManager extends ChangeNotifier {
 
   @override
   void dispose() {
+    _pairTimer?.cancel();
     _dataSub?.cancel();
     _connSub?.cancel();
     _device?.disconnect();

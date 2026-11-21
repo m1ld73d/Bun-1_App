@@ -153,6 +153,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
 
           // ── Input bar ────────────────────────────────────────────────────
+          _RecipientBar(manager: manager),
           SafeArea(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(8, 4, 8, 8),
@@ -223,6 +224,17 @@ class _ChatBubble extends StatelessWidget {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (m.label != null) ...[
+              Text(
+                m.mine ? '-> ${m.label}' : m.label!,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: FontWeight.w700,
+                  color: m.mine ? cs.onSurface : cs.onPrimary,
+                ),
+              ),
+              const SizedBox(height: 2),
+            ],
             Text(
               m.text,
               style: TextStyle(color: m.mine ? cs.onSurface : cs.onPrimary),
@@ -236,6 +248,65 @@ class _ChatBubble extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Recipient selector ─────────────────────────────────────────────────────────
+
+/// "to: <name>" button above the input bar. Picks the contact messages are
+/// encrypted for, or "everyone" (shared AES key).
+class _RecipientBar extends StatelessWidget {
+  final BoardManager manager;
+  const _RecipientBar({required this.manager});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final current = manager.recipient;
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(8, 4, 8, 0),
+      child: Align(
+        alignment: Alignment.centerLeft,
+        child: PopupMenuButton<String>(
+          tooltip: 'Choose who to send to',
+          onSelected: (id) {
+            if (id.isEmpty) {
+              manager.setRecipient(null);
+              return;
+            }
+            for (final c in manager.contacts) {
+              if (c.idHex == id) {
+                manager.setRecipient(c);
+                return;
+              }
+            }
+          },
+          itemBuilder: (_) => [
+            const PopupMenuItem<String>(
+              value: '',
+              child: Text('everyone (shared key)'),
+            ),
+            for (final c in manager.contacts)
+              PopupMenuItem<String>(value: c.idHex, child: Text(c.name)),
+          ],
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: cs.surface,
+              border: Border.all(color: cs.primary),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text('to: ${current?.name ?? 'everyone (shared key)'}'),
+                const Icon(Icons.arrow_drop_down_sharp),
+              ],
+            ),
+          ),
         ),
       ),
     );
